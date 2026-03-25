@@ -524,9 +524,9 @@ static void janet_schedule_general(JanetFiber *fiber, Janet value, JanetSignal s
     fiber->gc.flags |= JANET_FIBER_FLAG_ROOT;
     if (sig == JANET_SIGNAL_ERROR) fiber->gc.flags |= JANET_FIBER_EV_FLAG_CANCELED;
     if (soon) {
-        janet_q_push_head(&janet_vm.spawn, &t, sizeof(t));
+        janet_assert(!janet_q_push_head(&janet_vm.spawn, &t, sizeof(t)), "schedule queue overflow");
     } else {
-        janet_q_push(&janet_vm.spawn, &t, sizeof(t));
+        janet_assert(!janet_q_push(&janet_vm.spawn, &t, sizeof(t)), "schedule queue overflow");
     }
 }
 
@@ -959,11 +959,12 @@ static void janet_thread_chan_cb(JanetEVGenericMessage msg) {
             janet_schedule(fiber, janet_wrap_nil());
         }
     } else if (mode != JANET_CP_MODE_CLOSE) {
-        /* Fiber has already been cancelled or resumed. */
+        /* Fiber has already been canceled or resumed. */
         /* Resend event to another waiting thread, depending on mode */
         int is_read = (mode == JANET_CP_MODE_CHOICE_READ) || (mode == JANET_CP_MODE_READ);
         if (is_read) {
             JanetChannelPending reader;
+            int sent = 0;
             while (!janet_q_pop(&channel->read_pending, &reader, sizeof(reader))) {
                 JanetVM *vm = reader.thread;
                 if (!vm) continue;
@@ -974,7 +975,11 @@ static void janet_thread_chan_cb(JanetEVGenericMessage msg) {
                 msg.argp = channel;
                 msg.argj = x;
                 janet_ev_post_event(vm, janet_thread_chan_cb, msg);
+                sent = 1;
                 break;
+            }
+            if (!sent) {
+                janet_chan_unpack(channel, &x, 1);
             }
         } else {
             JanetChannelPending writer;
@@ -1001,13 +1006,13 @@ static void janet_thread_chan_cb(JanetEVGenericMessage msg) {
 static int janet_channel_push_with_lock(JanetChannel *channel, Janet x, int mode) {
     JanetChannelPending reader;
     int is_empty;
-    if (janet_chan_pack(channel, &x)) {
-        janet_chan_unlock(channel);
-        janet_panicf("failed to pack value for channel: %v", x);
-    }
     if (channel->closed) {
         janet_chan_unlock(channel);
         janet_panic("cannot write to closed channel");
+    }
+    if (janet_chan_pack(channel, &x)) {
+        janet_chan_unlock(channel);
+        janet_panicf("failed to pack value for channel: %v", x);
     }
     int is_threaded = janet_chan_is_threaded(channel);
     if (is_threaded) {
@@ -1021,6 +1026,7 @@ static int janet_channel_push_with_lock(JanetChannel *channel, Janet x, int mode
     if (is_empty) {
         /* No pending reader */
         if (janet_q_push(&channel->items, &x, sizeof(Janet))) {
+            janet_chan_unpack(channel, &x, 1);
             janet_chan_unlock(channel);
             janet_panicf("channel overflow: %v", x);
         } else if (janet_q_count(&channel->items) > channel->limit) {
@@ -1054,6 +1060,9 @@ static int janet_channel_push_with_lock(JanetChannel *channel, Janet x, int mode
             msg.argj = x;
             if (vm) {
                 janet_ev_post_event(vm, janet_thread_chan_cb, msg);
+            } else {
+                /* If no vm to send to, we must clean up (unpack) the packed payload to avoid leak */
+                janet_chan_unpack(channel, &x, 1);
             }
         } else {
             if (reader.mode == JANET_CP_MODE_CHOICE_READ) {
@@ -1163,7 +1172,7 @@ JanetChannel *janet_channel_make(uint32_t limit) {
 JanetChannel *janet_channel_make_threaded(uint32_t limit) {
     janet_assert(limit <= INT32_MAX, "bad limit");
     JanetChannel *channel = janet_abstract_threaded(&janet_channel_type, sizeof(JanetChannel));
-    janet_chan_init(channel, (int32_t) limit, 0);
+    janet_chan_init(channel, (int32_t) limit, 1);
     return channel;
 }
 
@@ -1199,20 +1208,6 @@ JANET_CORE_FN(cfun_channel_pop,
     janet_await();
 }
 
-static void chan_unlock_args(const Janet *argv, int32_t n) {
-    for (int32_t i = 0; i < n; i++) {
-        int32_t len;
-        const Janet *data;
-        JanetChannel *chan;
-        if (janet_indexed_view(argv[i], &data, &len) && len == 2) {
-            chan = janet_getchannel(data, 0);
-        } else {
-            chan = janet_getchannel(argv, i);
-        }
-        janet_chan_unlock(chan);
-    }
-}
-
 JANET_CORE_FN(cfun_channel_choice,
               "(ev/select & clauses)",
               "Block until the first of several channel operations occur. Returns a "
@@ -1241,29 +1236,27 @@ JANET_CORE_FN(cfun_channel_choice,
             janet_chan_lock(chan);
             if (chan->closed) {
                 janet_chan_unlock(chan);
-                chan_unlock_args(argv, i);
                 return make_close_result(chan);
             }
             if (janet_q_count(&chan->items) < chan->limit) {
                 janet_channel_push_with_lock(chan, data[1], 1);
-                chan_unlock_args(argv, i);
                 return make_write_result(chan);
             }
+            janet_chan_unlock(chan);
         } else {
             /* Read */
             JanetChannel *chan = janet_getchannel(argv, i);
             janet_chan_lock(chan);
             if (chan->closed) {
                 janet_chan_unlock(chan);
-                chan_unlock_args(argv, i);
                 return make_close_result(chan);
             }
             if (chan->items.head != chan->items.tail) {
                 Janet item;
                 janet_channel_pop_with_lock(chan, &item, 1);
-                chan_unlock_args(argv, i);
                 return make_read_result(chan, item);
             }
+            janet_chan_unlock(chan);
         }
     }
 
@@ -1474,11 +1467,12 @@ static void *janet_chanat_unmarshal(JanetMarshalContext *ctx) {
     int32_t limit = janet_unmarshal_int(ctx);
     int32_t count = janet_unmarshal_int(ctx);
     if (count < 0) janet_panic("invalid negative channel count");
+    if (count > limit) janet_panic("invalid channel count");
     janet_chan_init(abst, limit, 0);
     abst->closed = !!is_closed;
     for (int32_t i = 0; i < count; i++) {
         Janet item = janet_unmarshal_janet(ctx);
-        janet_q_push(&abst->items, &item, sizeof(item));
+        janet_assert(!janet_q_push(&abst->items, &item, sizeof(item)), "bad unmarshal channel");
     }
     return abst;
 }
@@ -1718,20 +1712,20 @@ void janet_loop1_impl(int has_timeout, JanetTimestamp to) {
             janet_free(response);
         } else {
             /* Normal event */
+            JanetOverlapped *jo = (JanetOverlapped *) overlapped;
             JanetStream *stream = (JanetStream *) completionKey;
             JanetFiber *fiber = NULL;
-            if (stream->read_fiber && stream->read_fiber->ev_state == overlapped) {
+            if (stream->read_fiber && stream->read_fiber->ev_state == jo) {
                 fiber = stream->read_fiber;
-            } else if (stream->write_fiber && stream->write_fiber->ev_state == overlapped) {
+            } else if (stream->write_fiber && stream->write_fiber->ev_state == jo) {
                 fiber = stream->write_fiber;
             }
             if (fiber != NULL) {
                 fiber->flags &= ~JANET_FIBER_EV_FLAG_IN_FLIGHT;
-                /* System is done with this, we can reused this data */
-                overlapped->InternalHigh = (ULONG_PTR) num_bytes_transferred;
+                jo->bytes_transfered = (ULONG_PTR) num_bytes_transferred;
                 fiber->ev_callback(fiber, result ? JANET_ASYNC_EVENT_COMPLETE : JANET_ASYNC_EVENT_FAILED);
             } else {
-                janet_free((void *) overlapped);
+                janet_free((void *) jo);
                 janet_ev_dec_refcount();
             }
             janet_stream_checktoclose(stream);
@@ -2416,7 +2410,7 @@ Janet janet_ev_lasterr(void) {
                   msgbuf,
                   sizeof(msgbuf),
                   NULL);
-    if (!*msgbuf) sprintf(msgbuf, "%d", code);
+    if (!*msgbuf) snprintf(msgbuf, sizeof(msgbuf), "%d", code);
     char *c = msgbuf;
     while (*c) {
         if (*c == '\n' || *c == '\r') {
@@ -2443,7 +2437,7 @@ typedef enum {
 
 typedef struct {
 #ifdef JANET_WINDOWS
-    OVERLAPPED overlapped;
+    JanetOverlapped overlapped;
     DWORD flags;
 #ifdef JANET_NET
     WSABUF wbuf;
@@ -2478,7 +2472,7 @@ void ev_callback_read(JanetFiber *fiber, JanetAsyncEvent event) {
         case JANET_ASYNC_EVENT_FAILED:
         case JANET_ASYNC_EVENT_COMPLETE: {
             /* Called when read finished */
-            uint32_t ev_bytes = (uint32_t) state->overlapped.InternalHigh;
+            uint32_t ev_bytes = (uint32_t) state->overlapped.bytes_transfered;
             state->bytes_read += ev_bytes;
             if (state->bytes_read == 0 && (state->mode != JANET_ASYNC_READMODE_RECVFROM)) {
                 janet_schedule(fiber, janet_wrap_nil());
@@ -2510,7 +2504,7 @@ void ev_callback_read(JanetFiber *fiber, JanetAsyncEvent event) {
         /* fallthrough */
         case JANET_ASYNC_EVENT_INIT: {
             int32_t chunk_size = state->bytes_left > JANET_EV_CHUNKSIZE ? JANET_EV_CHUNKSIZE : state->bytes_left;
-            memset(&(state->overlapped), 0, sizeof(OVERLAPPED));
+            memset(&(state->overlapped), 0, sizeof(JanetOverlapped));
             int status;
 #ifdef JANET_NET
             if (state->mode == JANET_ASYNC_READMODE_RECVFROM) {
@@ -2518,7 +2512,7 @@ void ev_callback_read(JanetFiber *fiber, JanetAsyncEvent event) {
                 state->wbuf.buf = (char *) state->chunk_buf;
                 state->fromlen = sizeof(state->from);
                 status = WSARecvFrom((SOCKET) stream->handle, &state->wbuf, 1,
-                                     NULL, &state->flags, &state->from, &state->fromlen, &state->overlapped, NULL);
+                                     NULL, &state->flags, &state->from, &state->fromlen, &state->overlapped.as.wsaoverlapped, NULL);
                 if (status && (WSA_IO_PENDING != WSAGetLastError())) {
                     janet_cancel(fiber, janet_ev_lasterr());
                     janet_async_end(fiber);
@@ -2529,9 +2523,9 @@ void ev_callback_read(JanetFiber *fiber, JanetAsyncEvent event) {
             {
                 /* Some handles (not all) read from the offset in lpOverlapped
                  * if its not set before calling `ReadFile` these streams will always read from offset 0 */
-                state->overlapped.Offset = (DWORD) state->bytes_read;
+                state->overlapped.as.overlapped.Offset = (DWORD) state->bytes_read;
 
-                status = ReadFile(stream->handle, state->chunk_buf, chunk_size, NULL, &state->overlapped);
+                status = ReadFile(stream->handle, state->chunk_buf, chunk_size, NULL, &state->overlapped.as.overlapped);
                 if (!status && (ERROR_IO_PENDING != GetLastError())) {
                     if (GetLastError() == ERROR_BROKEN_PIPE) {
                         if (state->bytes_read) {
@@ -2687,7 +2681,7 @@ typedef enum {
 
 typedef struct {
 #ifdef JANET_WINDOWS
-    OVERLAPPED overlapped;
+    JanetOverlapped overlapped;
     DWORD flags;
 #ifdef JANET_NET
     WSABUF wbuf;
@@ -2728,7 +2722,7 @@ void ev_callback_write(JanetFiber *fiber, JanetAsyncEvent event) {
         case JANET_ASYNC_EVENT_FAILED:
         case JANET_ASYNC_EVENT_COMPLETE: {
             /* Called when write finished */
-            uint32_t ev_bytes = (uint32_t) state->overlapped.InternalHigh;
+            uint32_t ev_bytes = (uint32_t) state->overlapped.bytes_transfered;
             if (ev_bytes == 0 && (state->mode != JANET_ASYNC_WRITEMODE_SENDTO)) {
                 janet_cancel(fiber, janet_cstringv("disconnect"));
                 janet_async_end(fiber);
@@ -2757,7 +2751,7 @@ void ev_callback_write(JanetFiber *fiber, JanetAsyncEvent event) {
                 bytes = state->src.str;
                 len = janet_string_length(bytes);
             }
-            memset(&(state->overlapped), 0, sizeof(WSAOVERLAPPED));
+            memset(&(state->overlapped), 0, sizeof(JanetOverlapped));
 
             int status;
 #ifdef JANET_NET
@@ -2767,7 +2761,7 @@ void ev_callback_write(JanetFiber *fiber, JanetAsyncEvent event) {
                 state->wbuf.len = len;
                 const struct sockaddr *to = state->dest_abst;
                 int tolen = (int) janet_abstract_size((void *) to);
-                status = WSASendTo(sock, &state->wbuf, 1, NULL, state->flags, to, tolen, &state->overlapped, NULL);
+                status = WSASendTo(sock, &state->wbuf, 1, NULL, state->flags, to, tolen, &state->overlapped.as.wsaoverlapped, NULL);
                 if (status) {
                     if (WSA_IO_PENDING == WSAGetLastError()) {
                         janet_async_in_flight(fiber);
@@ -2790,9 +2784,9 @@ void ev_callback_write(JanetFiber *fiber, JanetAsyncEvent event) {
                  * for more details see the lpOverlapped parameter in
                  * https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-writefile
                  */
-                state->overlapped.Offset = (DWORD) 0xFFFFFFFF;
-                state->overlapped.OffsetHigh = (DWORD) 0xFFFFFFFF;
-                status = WriteFile(stream->handle, bytes, len, NULL, &state->overlapped);
+                state->overlapped.as.overlapped.Offset = (DWORD) 0xFFFFFFFF;
+                state->overlapped.as.overlapped.OffsetHigh = (DWORD) 0xFFFFFFFF;
+                status = WriteFile(stream->handle, bytes, len, NULL, &state->overlapped.as.overlapped);
                 if (!status) {
                     if (ERROR_IO_PENDING == GetLastError()) {
                         janet_async_in_flight(fiber);
@@ -2948,10 +2942,11 @@ int janet_make_pipe(JanetHandle handles[2], int mode) {
         if (!CreatePipe(handles, handles + 1, &saAttr, 0)) return -1;
         return 0;
     }
-    sprintf(PipeNameBuffer,
-            "\\\\.\\Pipe\\JanetPipeFile.%08x.%08x",
-            (unsigned int) GetCurrentProcessId(),
-            (unsigned int) InterlockedIncrement(&PipeSerialNumber));
+    snprintf(PipeNameBuffer,
+             sizeof(PipeNameBuffer),
+             "\\\\.\\Pipe\\JanetPipeFile.%08x.%08x",
+             (unsigned int) GetCurrentProcessId(),
+             (unsigned int) InterlockedIncrement(&PipeSerialNumber));
 
     /* server handle goes to subprocess */
     shandle = CreateNamedPipeA(

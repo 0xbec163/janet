@@ -2,6 +2,23 @@
 All notable changes to this project will be documented in this file.
 
 ## Unreleased - ???
+- Documentation fixes
+- ev/thread-chan deadlock bug fixed
+- Re-add removed support for non-blocking net/connect on windows.
+
+## 1.41.2 - 2026-02-18
+- Fix regressions in `put` for arrays and buffers.
+- Add `module/add-file-extension`
+- Add `module/add-syspath`
+- Fix issue with possible stack corrpution with abstract types that modify the current fiber.
+- Allow use of the interpreter and garbage collection inside module entry for native modules.
+
+## 1.41.1 - 2026-02-15
+- Revert to blocking behaior of `net/connect` on windows to fix spurious errors.
+- Allow overriding the loader when doing imports with the `:loader` argument.
+- Allow importing modules with a path extension to do what one would expect.
+- Add `find-all` argument to `module/find`
+- Add :threads, :unmarshal, :compiler, and :asm sandbox flags.
 - Add support for persistent REPL history with the environment variable `JANET_HISTFILE`
 - Fix a number of fuzzer-found compiler bugs
 - Fix windows processes launching bug with empty environment table that caused process-launch failures.

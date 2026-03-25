@@ -91,29 +91,38 @@ void janetc_freeslot(JanetCompiler *c, JanetSlot s) {
 }
 
 /* Add a slot to a scope with a symbol associated with it (def or var). */
-void janetc_nameslot(JanetCompiler *c, const uint8_t *sym, JanetSlot s) {
+void janetc_nameslot(JanetCompiler *c, const uint8_t *sym, JanetSlot s, uint32_t flags) {
+    if (!(flags & JANET_DEFFLAG_NO_SHADOWCHECK)) {
+        if (sym[0] != '_') {
+            switch (janetc_shadowcheck(c, sym)) {
+                default:
+                    break;
+                case JANETC_SHADOW_MACRO:
+                    janetc_lintf(c, JANET_C_LINT_NORMAL, "binding %q is shadowing a macro", janet_wrap_symbol(sym));
+                    break;
+                case JANETC_SHADOW_LOCAL_HIDES_LOCAL:
+                    janetc_lintf(c, JANET_C_LINT_STRICT, "binding %q is shadowing a binding", janet_wrap_symbol(sym));
+                    break;
+                case JANETC_SHADOW_LOCAL_HIDES_GLOBAL:
+                    janetc_lintf(c, JANET_C_LINT_STRICT, "binding %q is shadowing a top-level binding", janet_wrap_symbol(sym));
+                    break;
+                case JANETC_SHADOW_GLOBAL_HIDES_GLOBAL:
+                    janetc_lintf(c, JANET_C_LINT_STRICT, "top-level binding %q is shadowing another top-level binding", janet_wrap_symbol(sym));
+                    break;
+            }
+        }
+    }
     SymPair sp;
     int32_t cnt = janet_v_count(c->buffer);
     sp.sym = sym;
     sp.sym2 = sym;
     sp.slot = s;
     sp.keep = 0;
-    sp.referenced = sym[0] == '_'; /* Fake ref if symbol is _ to avoid lints */
-    sp.slot.flags |= JANET_SLOT_NAMED;
-    sp.birth_pc = cnt ? cnt - 1 : 0;
-    sp.death_pc = UINT32_MAX;
-    janet_v_push(c->scope->syms, sp);
-}
-
-/* Same as janetc_nameslot, but don't have a lint for unused bindings. */
-void janetc_nameslot_no_unused(JanetCompiler *c, const uint8_t *sym, JanetSlot s) {
-    SymPair sp;
-    int32_t cnt = janet_v_count(c->buffer);
-    sp.sym = sym;
-    sp.sym2 = sym;
-    sp.slot = s;
-    sp.keep = 0;
-    sp.referenced = 1;
+    if (flags & JANET_DEFFLAG_NO_UNUSED) {
+        sp.referenced = 1;
+    } else {
+        sp.referenced = sym[0] == '_'; /* Fake ref if symbol starts with _ to avoid lints */
+    }
     sp.slot.flags |= JANET_SLOT_NAMED;
     sp.birth_pc = cnt ? cnt - 1 : 0;
     sp.death_pc = UINT32_MAX;
@@ -258,6 +267,38 @@ static int lookup_missing(
     /* Alternative could use janet_resolve_ext(c->env, sym) to read result from environment. */
     *out = janet_binding_from_entry(tempOut);
     return 1;
+}
+
+/* Check if a binding is defined in an upper scope. This lets us check for
+ * variable shadowing. */
+Shadowing janetc_shadowcheck(JanetCompiler *c, const uint8_t *sym) {
+    /* Check locals */
+    JanetScope *scope = c->scope;
+    int is_global = (scope->flags & JANET_SCOPE_TOP);
+    while (scope) {
+        int32_t len = janet_v_count(scope->syms);
+        for (int32_t i = len - 1; i >= 0; i--) {
+            SymPair *pair = scope->syms + i;
+            if (pair->sym == sym) {
+                janet_assert(!is_global, "shadowing analysis is incorrect. compiler bug");
+                return JANETC_SHADOW_LOCAL_HIDES_LOCAL;
+            }
+        }
+        scope = scope->parent;
+    }
+    /* Check globals */
+    JanetBinding binding = janet_resolve_ext(c->env, sym);
+    if (binding.type == JANET_BINDING_MACRO || binding.type == JANET_BINDING_DYNAMIC_MACRO) {
+        return JANETC_SHADOW_MACRO;
+    } else if (binding.type == JANET_BINDING_NONE) {
+        return JANETC_SHADOW_NONE;
+    } else {
+        if (is_global) {
+            return JANETC_SHADOW_GLOBAL_HIDES_GLOBAL;
+        } else {
+            return JANETC_SHADOW_LOCAL_HIDES_GLOBAL;
+        }
+    }
 }
 
 /* Allow searching for symbols. Return information about the symbol */
@@ -459,11 +500,22 @@ JanetSlot *janetc_toslotskv(JanetCompiler *c, Janet ds) {
     const JanetKV *kvs = NULL;
     int32_t cap = 0, len = 0;
     janet_dictionary_view(ds, &kvs, &len, &cap);
-    for (int32_t i = 0; i < cap; i++) {
-        if (janet_checktype(kvs[i].key, JANET_NIL)) continue;
-        janet_v_push(ret, janetc_value(subopts, kvs[i].key));
-        janet_v_push(ret, janetc_value(subopts, kvs[i].value));
+    /* Sort keys for stability of order? */
+    int32_t *index_buf;
+    int32_t index_buf_stack[32];
+    int32_t *index_buf_heap = NULL;
+    if (len < 32) {
+        index_buf = index_buf_stack;
+    } else {
+        index_buf_heap = janet_smalloc(sizeof(int32_t) * len);
+        index_buf = index_buf_heap;
     }
+    if (len) janet_sorted_keys(kvs, cap, index_buf);
+    for (int32_t i = 0; i < len; i++) {
+        janet_v_push(ret, janetc_value(subopts, kvs[index_buf[i]].key));
+        janet_v_push(ret, janetc_value(subopts, kvs[index_buf[i]].value));
+    }
+    if (index_buf_heap) janet_sfree(index_buf_heap);
     return ret;
 }
 
@@ -1092,6 +1144,7 @@ static void janetc_init(JanetCompiler *c, JanetTable *env, const uint8_t *where,
     c->current_mapping.line = -1;
     c->current_mapping.column = -1;
     c->lints = lints;
+    c->is_redef = janet_truthy(janet_table_get_keyword(c->env, "redef"));
     /* Init result */
     c->result.error = NULL;
     c->result.status = JANET_COMPILE_OK;

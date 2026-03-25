@@ -46,7 +46,6 @@
 (defn defmacro :macro :flycheck
   "Define a macro."
   [name & more]
-  (setdyn name @{}) # override old macro definitions in the case of a recursive macro
   (apply defn name :macro more))
 
 (defmacro as-macro
@@ -219,9 +218,9 @@
 
 (defmacro default
   ``Define a default value for an optional argument.
-  Expands to `(def sym (if (= nil sym) val sym))`.``
+  Expands to `(def sym :shadow (if (= nil sym) val sym))`.``
   [sym val]
-  ~(def ,sym (if (,= nil ,sym) ,val ,sym)))
+  ~(def ,sym :shadow (if (,= nil ,sym) ,val ,sym)))
 
 (defmacro comment
   "Ignores the body of the comment."
@@ -443,11 +442,36 @@
      (def ,binding ,ctor)
      ,(defer-impl :with [(or dtor :close) binding] body)))
 
+# declare ahead of time
+(var- macexvar nil)
+
+(defmacro if-let
+  ``Make multiple bindings, and if all are truthy,
+  evaluate the `tru` form. If any are false or nil, evaluate
+  the `fal` form. Bindings have the same syntax as the `let` macro.``
+  [bindings tru &opt fal]
+  (def len (length bindings))
+  (if (= 0 len) (error "expected at least 1 binding"))
+  (if (odd? len) (error "expected an even number of bindings"))
+  (def fal2 (if macexvar (macexvar fal) fal))
+  (defn aux [i]
+    (if (>= i len)
+      tru
+      (do
+        (def bl (in bindings i))
+        (def br (in bindings (+ 1 i)))
+        (if (symbol? bl)
+          ~(if (def ,bl ,br) ,(aux (+ 2 i)) ,fal2)
+          ~(if (def ,(def sym (gensym)) ,br)
+             (do (def ,bl ,sym) ,(aux (+ 2 i)))
+             ,fal2)))))
+  (aux 0))
+
 (defmacro when-with
   ``Similar to with, but if binding is false or nil, returns
   nil without evaluating the body. Otherwise, the same as `with`.``
   [[binding ctor dtor] & body]
-  ~(if-let [,binding ,ctor]
+  ~(as-macro ,if-let [,binding ,ctor]
      ,(defer-impl :when-with [(or dtor :close) binding] body)))
 
 (defmacro if-with
@@ -455,7 +479,7 @@
   the falsey path. Otherwise, evaluates the truthy path. In both cases,
   `ctor` is bound to binding.``
   [[binding ctor dtor] truthy &opt falsey]
-  ~(if-let [,binding ,ctor]
+  ~(as-macro ,if-let [,binding ,ctor]
      ,(defer-impl :if-with [(or dtor :close) binding] [truthy])
      ,falsey))
 
@@ -539,13 +563,13 @@
         (case binding
           :until ~(do (if ,verb (break) nil) ,rest)
           :while ~(do (if ,verb nil (break)) ,rest)
-          :let ~(let ,verb (do ,rest))
+          :let ~(as-macro ,let ,verb (do ,rest))
           :after ~(do ,rest ,verb nil)
           :before ~(do ,verb ,rest nil)
           :repeat (with-syms [iter]
-                    ~(do (var ,iter ,verb) (while (> ,iter 0) ,rest (-- ,iter))))
-          :when ~(when ,verb ,rest)
-          :unless ~(unless ,verb ,rest)
+                    ~(do (var ,iter ,verb) (while (,> ,iter 0) ,rest (as-macro ,-- ,iter))))
+          :when ~(as-macro ,when ,verb ,rest)
+          :unless ~(as-macro ,unless ,verb ,rest)
           (error (string "unexpected loop modifier " binding))))))
 
   # 3 term expression
@@ -587,7 +611,7 @@
   "Evaluate body n times. If n is negative, body will be evaluated 0 times. Evaluates to nil."
   [n & body]
   (with-syms [iter]
-    ~(do (var ,iter ,n) (while (> ,iter 0) ,;body (-- ,iter)))))
+    ~(do (var ,iter ,n) (while (,> ,iter 0) ,;body (as-macro ,-- ,iter)))))
 
 (defmacro forever
   "Evaluate body forever in a loop, or until a break statement."
@@ -683,7 +707,7 @@
   [head & body]
   (def $accum (gensym))
   (check-empty-body body)
-  ~(do (def ,$accum @[]) (loop ,head (,array/push ,$accum (do ,;body))) ,$accum))
+  ~(do (def ,$accum @[]) (as-macro ,loop ,head (,array/push ,$accum (do ,;body))) ,$accum))
 
 (defmacro catseq
   ``Similar to `loop`, but concatenates each element from the loop body into an array and returns that.
@@ -691,21 +715,21 @@
   [head & body]
   (def $accum (gensym))
   (check-empty-body body)
-  ~(do (def ,$accum @[]) (loop ,head (,array/concat ,$accum (do ,;body))) ,$accum))
+  ~(do (def ,$accum @[]) (as-macro ,loop ,head (,array/concat ,$accum (do ,;body))) ,$accum))
 
 (defmacro tabseq
   ``Similar to `loop`, but accumulates key value pairs into a table.
   See `loop` for details.``
   [head key-body & value-body]
   (def $accum (gensym))
-  ~(do (def ,$accum @{}) (loop ,head (,put ,$accum ,key-body (do ,;value-body))) ,$accum))
+  ~(do (def ,$accum @{}) (as-macro ,loop ,head (,put ,$accum ,key-body (do ,;value-body))) ,$accum))
 
 (defmacro generate
   ``Create a generator expression using the `loop` syntax. Returns a fiber
   that yields all values inside the loop in order. See `loop` for details.``
   [head & body]
   (check-empty-body body)
-  ~(,fiber/new (fn :generate [] (loop ,head (yield (do ,;body)))) :yi))
+  ~(,fiber/new (fn :generate [] (as-macro ,loop ,head (,yield (do ,;body)))) :yi))
 
 (defmacro coro
   "A wrapper for making fibers that may yield multiple values (coroutine). Same as `(fiber/new (fn [] ;body) :yi)`."
@@ -754,35 +778,10 @@
   (each x xs (*= accum x))
   accum)
 
-# declare ahead of time
-(var- macexvar nil)
-
-(defmacro if-let
-  ``Make multiple bindings, and if all are truthy,
-  evaluate the `tru` form. If any are false or nil, evaluate
-  the `fal` form. Bindings have the same syntax as the `let` macro.``
-  [bindings tru &opt fal]
-  (def len (length bindings))
-  (if (= 0 len) (error "expected at least 1 binding"))
-  (if (odd? len) (error "expected an even number of bindings"))
-  (def fal2 (if macexvar (macexvar fal) fal))
-  (defn aux [i]
-    (if (>= i len)
-      tru
-      (do
-        (def bl (in bindings i))
-        (def br (in bindings (+ 1 i)))
-        (if (symbol? bl)
-          ~(if (def ,bl ,br) ,(aux (+ 2 i)) ,fal2)
-          ~(if (def ,(def sym (gensym)) ,br)
-             (do (def ,bl ,sym) ,(aux (+ 2 i)))
-             ,fal2)))))
-  (aux 0))
-
 (defmacro when-let
   "Same as `(if-let bindings (do ;body))`."
   [bindings & body]
-  ~(if-let ,bindings (do ,;body)))
+  ~(as-macro ,if-let ,bindings (do ,;body)))
 
 (defn comp
   `Takes multiple functions and returns a function that is the composition
@@ -1432,7 +1431,7 @@
                  (tuple n @[])))
     (def sym (gensym))
     (def parts (array/concat @[h sym] t))
-    ~(let [,sym ,last] (if ,sym ,(keep-syntax! n parts))))
+    ~(as-macro ,let [,sym ,last] (if ,sym ,(keep-syntax! n parts))))
   (reduce fop x forms))
 
 (defmacro -?>>
@@ -1448,7 +1447,7 @@
                  (tuple n @[])))
     (def sym (gensym))
     (def parts (array/concat @[h] t @[sym]))
-    ~(let [,sym ,last] (if ,sym ,(keep-syntax! n parts))))
+    ~(as-macro ,let [,sym ,last] (if ,sym ,(keep-syntax! n parts))))
   (reduce fop x forms))
 
 (defn- walk-ind [f form]
@@ -2182,10 +2181,10 @@
     (def last (in t (- (length t) 1)))
     (def bound (in t 1))
     (keep-syntax! t
-      (array/concat
-        @[(in t 0) (expand-bindings bound)]
-        (tuple/slice t 2 -2)
-        @[(recur last)])))
+                  (array/concat
+                    @[(in t 0) (expand-bindings bound)]
+                    (tuple/slice t 2 -2)
+                    @[(recur last)])))
 
   (defn expandall [t]
     (def args (map recur (tuple/slice t 1)))
@@ -2411,8 +2410,8 @@
       (dictionary? m) (merge-into metadata m)
       (error (string "invalid metadata " m))))
   (with-syms [entry old-entry f]
-    ~(let [,old-entry (,dyn ',name)]
-       (def ,entry (or ,old-entry @{:ref @[nil]}))
+    ~(as-macro ,let [,old-entry (,dyn ',name)]
+       (def ,entry (as-macro ,or ,old-entry @{:ref @[nil]}))
        (,setdyn ',name ,entry)
        (def ,f ,fbody)
        (,put-in ,entry [:ref 0] ,f)
@@ -2675,17 +2674,17 @@
     (var resumeval nil)
     (def f
       (fiber/new
-        (fn []
+        (fn :compile-and-lint []
           (array/clear lints)
           (def res (compile source env where lints))
-          (unless (empty? lints)
+          (when (next lints)
             # Convert lint levels to numbers.
             (def levels (get env *lint-levels* lint-levels))
             (def lint-error (get env *lint-error*))
             (def lint-warning (get env *lint-warn*))
             (def lint-error (or (get levels lint-error lint-error) 0))
             (def lint-warning (or (get levels lint-warning lint-warning) 2))
-            (each [level line col msg] lints
+            (each [level line col msg] (distinct lints) # some macros might cause code to be duplicated. Avoid repeated messages.
               (def lvl (get lint-levels level 0))
               (cond
                 (<= lvl lint-error) (do
@@ -2874,7 +2873,8 @@
 
 (defn- check-dyn-relative [x] (if (string/has-prefix? "@" x) x))
 (defn- check-relative [x] (if (string/has-prefix? "." x) x))
-(defn- check-not-relative [x] (if-not (string/has-prefix? "." x) x))
+# Don't try to preload absolute or relative paths
+(defn- check-preloadable [x] (if-not (or (string/has-prefix? "/" x) (string/find "." x) (string/find "@" x)) x))
 (defn- check-is-dep [x] (unless (or (string/has-prefix? "/" x) (string/has-prefix? "@" x) (string/has-prefix? "." x)) x))
 (defn- check-project-relative [x] (if (string/has-prefix? "/" x) x))
 
@@ -2926,8 +2926,21 @@
   (array/insert mp curall-index [(string ":cur:/:all:" ext) loader check-relative])
   mp)
 
+(defn module/add-file-extension
+  ```
+  Add paths to `module/paths` for a given file extension such that
+  the programmer can import a module by relative or absolute path from
+  the current working directory.
+  Returns the modified `module/paths`.
+  ```
+  [ext loader]
+  (assert (string/has-prefix? "." ext) "file extension must have . prefix")
+  (def mp (dyn *module-paths* module/paths))
+  (array/insert mp 0 [":all:" loader (fn :check-ext [x] (string/has-suffix? ext x))])
+  mp)
+
 # Don't expose this externally yet - could break if custom module/paths is setup.
-(defn- module/add-syspath
+(defn module/add-syspath
   ```
   Add a custom syspath to `module/paths` by duplicating all entries that being with `:sys:` and
   adding duplicates with a specific path prefix instead.
@@ -2948,7 +2961,16 @@
 (module/add-paths "/init.janet" :source)
 (module/add-paths ".janet" :source)
 (module/add-paths ".jimage" :image)
-(array/insert module/paths 0 [(fn is-cached [path] (if (in (dyn *module-cache* module/cache) path) path)) :preload check-not-relative])
+(module/add-file-extension ".janet" :source)
+(module/add-file-extension ".jimage" :source)
+# These obviously won't work on all platforms, but if a user explicitly
+# tries to import them, we may as well try.
+(module/add-file-extension ".so" :native)
+(module/add-file-extension ".dll" :native)
+(array/insert module/paths 0
+              [(fn is-cached [path] (if (in (dyn *module-cache* module/cache) path) path))
+               :preload
+               check-preloadable])
 
 # Version of fexists that works even with a reduced OS
 (defn- fexists
@@ -2976,20 +2998,22 @@
   or :image if the module is found, otherwise a tuple with nil followed by
   an error message.
   ```
-  [path]
+  [path &opt find-all]
   (var ret nil)
   (def mp (dyn *module-paths* module/paths))
+  (def all-matches (if find-all @[]))
   (each [p mod-kind checker] mp
     (when (mod-filter checker path)
       (if (function? p)
         (when-let [res (p path)]
           (set ret [res mod-kind])
-          (break))
+          (if find-all (array/push all-matches ret) (break)))
         (do
           (def fullpath (string (module/expand-path path p)))
           (when (fexists fullpath)
             (set ret [fullpath mod-kind])
-            (break))))))
+            (if find-all (array/push all-matches ret) (break)))))))
+  (if find-all (break all-matches))
   (if ret ret
     (let [expander (fn :expander [[t _ chk]]
                      (when (string? t)
@@ -3164,7 +3188,10 @@
 
 (defn- require-1
   [path args kargs]
-  (def [fullpath mod-kind] (module/find path))
+  (def [fullpath mod-kind]
+    (if-let [loader (get kargs :loader)]
+      [path loader]
+      (module/find path)))
   (unless fullpath (error mod-kind))
   (def mc (dyn *module-cache* module/cache))
   (def ml (dyn *module-loading* module/loading))
@@ -3213,7 +3240,7 @@
   (def prefix (or
                 (and as (string as "/"))
                 prefix
-                (string (last (string/split "/" path)) "/")))
+                (string (first (string/split "." (last (string/split "/" path)))) "/")))
   (merge-module env newenv prefix ep only))
 
 (defmacro import
@@ -3273,7 +3300,6 @@
   (from prototype tables).``
   [&opt env local]
   (env-walk keyword? env local))
-
 
 (defdyn *doc-width*
   "Width in columns to print documentation printed with `doc-format`.")
@@ -3926,7 +3952,7 @@
     ``
     [sec & body]
     (with-syms [f]
-      ~(let [,f (coro ,;body)]
+      ~(as-macro ,let [,f (as-macro ,coro ,;body)]
          (,ev/deadline ,sec nil ,f)
          (,resume ,f))))
 
@@ -3987,7 +4013,7 @@
             "handler not supported for :datagram servers")
     (def s (net/listen host port type no-reuse))
     (if handler
-      (ev/go (fn [] (net/accept-loop s handler))))
+      (ev/go (fn :net/server-handler [] (net/accept-loop s handler))))
     s))
 
 ###
@@ -4058,15 +4084,15 @@
     (defn make-ptr []
       (assertf (ffi/lookup (if lazy (llib) lib) raw-symbol) "failed to find ffi symbol %v" raw-symbol))
     (if lazy
-      ~(defn ,alias ,;meta [,;formal-args]
+      ~(as-macro ,defn ,alias ,;meta [,;formal-args]
          (,ffi/call (,(delay (make-ptr))) (,(delay (make-sig))) ,;formal-args))
-      ~(defn ,alias ,;meta [,;formal-args]
+      ~(as-macro ,defn ,alias ,;meta [,;formal-args]
          (,ffi/call ,(make-ptr) ,(make-sig) ,;formal-args))))
 
   (defmacro ffi/defbind :flycheck
     "Generate bindings for native functions in a convenient manner."
     [name ret-type & body]
-    ~(ffi/defbind-alias ,name ,name ,ret-type ,;body)))
+    ~(as-macro ,ffi/defbind-alias ,name ,name ,ret-type ,;body)))
 
 ###
 ###
@@ -4643,8 +4669,7 @@
 
 (defn- run-main
   [env subargs arg]
-  (when-let [entry (in env 'main)
-             main (or (get entry :value) (in (get entry :ref) 0))]
+  (when-let [main (module/value env 'main true)]
     (def guard (if (get env :debug) :ydt :y))
     (defn wrap-main [&]
       (main ;subargs))
@@ -4733,7 +4758,8 @@
   (apply-color
     (and
       (not (getenv-alias "NO_COLOR"))
-      (os/isatty stdout)))
+      (os/isatty stdout)
+      (os/isatty stderr)))
 
   (defn- get-lint-level
     [i]

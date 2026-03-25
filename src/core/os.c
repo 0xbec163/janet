@@ -40,6 +40,7 @@
 #include <sys/stat.h>
 #include <signal.h>
 #include <locale.h>
+#include <inttypes.h>
 
 #ifdef JANET_BSD
 #include <sys/sysctl.h>
@@ -1331,7 +1332,7 @@ static Janet os_execute_impl(int32_t argc, Janet *argv, JanetExecuteMode mode) {
                       msgbuf,
                       sizeof(msgbuf),
                       NULL);
-        if (!*msgbuf) sprintf(msgbuf, "%d", cp_error_code);
+        if (!*msgbuf) snprintf(msgbuf, sizeof(msgbuf), "%" PRIu32, (uint32_t) cp_error_code);
         char *c = msgbuf;
         while (*c) {
             if (*c == '\n' || *c == '\r') {
@@ -2578,7 +2579,7 @@ JANET_CORE_FN(os_dir,
     char pattern[MAX_PATH + 1];
     if (strlen(dir) > (sizeof(pattern) - 3))
         janet_panicf("path too long: %s", dir);
-    sprintf(pattern, "%s/*", dir);
+    snprintf(pattern, sizeof(pattern), "%s/*", dir);
     intptr_t res = _findfirst(pattern, &afile);
     if (-1 == res) janet_panicv(janet_cstringv(janet_strerror(errno)));
     do {

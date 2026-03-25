@@ -335,10 +335,9 @@ int32_t janet_hash(Janet x) {
             } as;
             as.d = janet_unwrap_number(x);
             as.d += 0.0; /* normalize negative 0 */
-            uint32_t lo = (uint32_t)(as.u & 0xFFFFFFFF);
+            as.u = murmur64(as.u);
             uint32_t hi = (uint32_t)(as.u >> 32);
-            uint32_t hilo = (hi ^ lo) * 2654435769u;
-            hash = (int32_t)((hilo << 16) | (hilo >> 16));
+            hash = (int32_t)hi;
             break;
         }
         case JANET_ABSTRACT: {
@@ -496,7 +495,7 @@ Janet janet_in(Janet ds, Janet key) {
                 if (!(type->get)(janet_unwrap_abstract(ds), key, &value))
                     janet_panicf("key %v not found in %v ", key, ds);
             } else {
-                janet_panicf("no getter for %v ", ds);
+                janet_panicf("no getter for %v", ds);
             }
             break;
         }
@@ -623,7 +622,7 @@ Janet janet_getindex(Janet ds, int32_t index) {
                 if (!(type->get)(janet_unwrap_abstract(ds), janet_wrap_integer(index), &value))
                     value = janet_wrap_nil();
             } else {
-                janet_panicf("no getter for %v ", ds);
+                janet_panicf("no getter for %v", ds);
             }
             break;
         }
@@ -725,6 +724,9 @@ void janet_putindex(Janet ds, int32_t index, Janet value) {
             JanetArray *array = janet_unwrap_array(ds);
             if (index >= array->count) {
                 janet_array_ensure(array, index + 1, 2);
+                for (int32_t i = array->count; i < index + 1; i++) {
+                    array->data[i] = janet_wrap_nil();
+                }
                 array->count = index + 1;
             }
             array->data[index] = value;
@@ -736,6 +738,7 @@ void janet_putindex(Janet ds, int32_t index, Janet value) {
                 janet_panicf("can only put integers in buffers, got %v", value);
             if (index >= buffer->count) {
                 janet_buffer_ensure(buffer, index + 1, 2);
+                memset(buffer->data + buffer->count, 0, index + 1 - buffer->count);
                 buffer->count = index + 1;
             }
             buffer->data[index] = (uint8_t)(janet_unwrap_integer(value) & 0xFF);
@@ -769,6 +772,9 @@ void janet_put(Janet ds, Janet key, Janet value) {
             int32_t index = getter_checkint(type, key, INT32_MAX - 1);
             if (index >= array->count) {
                 janet_array_ensure(array, index + 1, 2);
+                for (int32_t i = array->count; i < index + 1; i++) {
+                    array->data[i] = janet_wrap_nil();
+                }
                 array->count = index + 1;
             }
             array->data[index] = value;
@@ -781,6 +787,7 @@ void janet_put(Janet ds, Janet key, Janet value) {
                 janet_panicf("can only put integers in buffers, got %v", value);
             if (index >= buffer->count) {
                 janet_buffer_ensure(buffer, index + 1, 2);
+                memset(buffer->data + buffer->count, 0, index + 1 - buffer->count);
                 buffer->count = index + 1;
             }
             buffer->data[index] = (uint8_t)(janet_unwrap_integer(value) & 0xFF);
